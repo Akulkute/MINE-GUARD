@@ -1,0 +1,208 @@
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <user_interface.h> // CRITICAL: Required for wifi_set_channel() on ESP8266
+
+// ============================= CONFIGURATION ==============================
+
+// CRITICAL: All devices must be on the same channel for the mesh to work.
+const uint8_t WIFI_CHANNEL = 6; 
+
+// -------------------- ESP-NOW Receiver MAC (Back PCB) --------------------
+uint8_t receiverMac[] = {0x68, 0x25, 0xDD, 0x32, 0xAB, 0x8C}; // MAC of the Back PCB
+
+// -------------------- MAX30105 & DS18B20 Pins/Variables --------------------
+MAX30105 particleSensor;
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+int bufferIndex = 0;
+long lastIRValue = 0;
+long lastBeat = 0;
+double heartRate = 0;
+double avgBPM = 0;
+const byte RATE_SIZE = 8;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+int beatCount = 0;
+
+#define ONE_WIRE_BUS 0
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+float temperatureC = 26.0;
+unsigned long lastTempMillis = 0;
+const unsigned long TEMP_INTERVAL = 60000; // 1 min
+
+// -------------------- LED & Button --------------------
+#define LED_PIN 1    // TX pin (used for alert feedback)
+#define BUTTON_PIN 3   // RX pin for button
+bool ledBlinking = false;
+unsigned long lastBlinkTime = 0;
+bool ledState = false;
+
+// -------------------- Send Interval --------------------
+unsigned long lastSendTime = 0;
+const unsigned long SEND_INTERVAL = 2000; // 2 sec
+
+
+// -------------------- ESP-NOW Callbacks --------------------
+void OnDataSent(uint8_t *mac_addr, uint8_t sendStatus) { 
+  // Optional debug: Serial.printf("Send status: %s\n", (sendStatus == 0) ? "Success" : "Failure");
+}
+
+void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
+ char msg[len + 1];
+ memcpy(msg, incomingData, len);
+ msg[len] = '\0';
+ // Trim whitespace and CR/LF
+ for (int i = 0; i < len; i++) {
+  if (msg[i] == '\r' || msg[i] == '\n' || msg[i] == ' ') msg[i] = '\0';
+ }
+
+ // Stop LED blinking when "N" or "n" received (Neutralize command from Repeater/Control Room)
+ if (msg[0] == 'N' || msg[0] == 'n') {
+  ledBlinking = false;
+  digitalWrite(LED_PIN, LOW);
+  ledState = false;
+  Serial.println("⮞ LED blinking stopped (Neutralized)");
+ }
+}
+
+void setup() {
+ Serial.begin(115200);
+ Serial.println("\n--- Hand PCB ---");
+
+ pinMode(LED_PIN, OUTPUT);
+ pinMode(BUTTON_PIN, INPUT_PULLUP);
+ digitalWrite(LED_PIN, LOW);
+
+ // --- DS18B20 ---
+ sensors.begin();
+ sensors.requestTemperatures();
+ temperatureC = sensors.getTempCByIndex(0);
+
+ // --- MAX30105 ---
+ Wire.begin(0, 2); 
+ if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+  Serial.println("❌ MAX30105 not found! Check wiring."); while (1);
+ }
+ particleSensor.setup();
+ particleSensor.setPulseAmplitudeRed(0x0A);
+ particleSensor.setPulseAmplitudeIR(0x0A);
+ particleSensor.setPulseAmplitudeGreen(0);
+
+ // --- ESP-NOW with Channel 6 ---
+ WiFi.mode(WIFI_STA);
+  // FIX for ESP8266: Use low-level function to set channel
+ wifi_set_channel(WIFI_CHANNEL); 
+ if (esp_now_init() != 0) {
+  Serial.println("❌ ESP-NOW init failed!"); while (true);
+ }
+
+ esp_now_set_self_role(ESP_NOW_ROLE_CONTROLLER);
+ esp_now_register_send_cb(OnDataSent);
+ // Add peer (Back PCB) with Channel 6
+ esp_now_add_peer(receiverMac, ESP_NOW_ROLE_SLAVE, WIFI_CHANNEL, NULL, 0); 
+ esp_now_register_recv_cb(OnDataRecv);
+
+ Serial.printf("✅ Hand PCB Ready on Channel %d\n", WIFI_CHANNEL);
+}
+
+void loop() {
+ // -------------------- Button Press (Manual Alert) --------------------
+ static bool lastButtonState = HIGH;
+ bool currentState = digitalRead(BUTTON_PIN);
+
+ if (lastButtonState == HIGH && currentState == LOW) {
+  ledBlinking = true;
+  char alertMsg[] = "ALERT:1"; // Signal to Back PCB for local alert activation
+  esp_now_send(receiverMac, (uint8_t *)alertMsg, strlen(alertMsg));
+  Serial.println("⮞ ALERT:1 sent (Manual Panic)");
+ }
+ lastButtonState = currentState;
+
+ // -------------------- Alert LED Blink Logic --------------------
+ if (ledBlinking) {
+  if (millis() - lastBlinkTime >= 500) {
+   lastBlinkTime = millis();
+   ledState = !ledState;
+   digitalWrite(LED_PIN, ledState);
+  }
+ } else if (ledState) {
+  ledState = false;
+  digitalWrite(LED_PIN, LOW);
+ }
+
+ // -------------------- Temperature Update --------------------
+ if (millis() - lastTempMillis >= TEMP_INTERVAL) {
+  sensors.requestTemperatures();
+  temperatureC = sensors.getTempCByIndex(0);
+  lastTempMillis = millis();
+ }
+
+ // -------------------- Heart Rate & SpO2 Reading --------------------
+ long irValue = particleSensor.getIR();
+ long redValue = particleSensor.getRed();
+ static int spo2 = 0;
+
+ if (irValue > 500) {
+  long filteredIR = (irValue * 0.2) + (lastIRValue * 0.8);
+  lastIRValue = filteredIR;
+
+  if (checkForBeat(filteredIR)) {
+   long delta = millis() - lastBeat;
+   lastBeat = millis();
+   double bpm = 60.0 / (delta / 1000.0);
+   if (bpm > 50 && bpm < 150) {
+    rates[rateSpot++] = (byte)bpm;
+    rateSpot %= RATE_SIZE;
+    if (beatCount < RATE_SIZE) beatCount++;
+    long sum = 0;
+    for (int i = 0; i < beatCount; i++) sum += rates[i];
+    avgBPM = (double)sum / beatCount;
+    heartRate = avgBPM;
+   }
+  }
+
+  irBuffer[bufferIndex] = irValue;
+  redBuffer[bufferIndex] = redValue;
+  bufferIndex++;
+
+  // --- SpO2 Calculation ---
+  if (bufferIndex >= BUFFER_SIZE) {
+   bufferIndex = 0;
+   float irDC = 0, redDC = 0, irAC = 0, redAC = 0;
+   for (int i = 0; i < BUFFER_SIZE; i++) { irDC += irBuffer[i]; redDC += redBuffer[i]; }
+   irDC /= BUFFER_SIZE; redDC /= BUFFER_SIZE;
+   for (int i = 0; i < BUFFER_SIZE; i++) { 
+        irAC += pow((float)irBuffer[i] - irDC, 2); 
+        redAC += pow((float)redBuffer[i] - redDC, 2); 
+      }
+   irAC = sqrt(irAC / BUFFER_SIZE);
+   redAC = sqrt(redAC / BUFFER_SIZE);
+
+   float R = (redAC / redDC) / (irAC / irDC);
+   spo2 = 104 - 17 * R;
+
+   if (spo2 > 100) spo2 = 100;
+   if (spo2 < 70) spo2 = 70;
+  }
+ }
+
+ // -------------------- Send Sensor Data to Back PCB --------------------
+ if (millis() - lastSendTime >= SEND_INTERVAL) {
+  lastSendTime = millis();
+  char message[100];
+  snprintf(message, sizeof(message),
+      "HR:%.1f,SpO2:%d,Temp:%.1f,Alert:%d",
+      heartRate, spo2, temperatureC, ledBlinking ? 1 : 0);
+  esp_now_send(receiverMac, (uint8_t *)message, strlen(message));
+  Serial.printf("📤 Sent to Back PCB: %s\n", message);
+ }
+
+ delay(20);
+}
