@@ -1,0 +1,271 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <string.h>
+#include <HTTPClient.h> 
+#include <WebServer.h> 
+#include <ArduinoJson.h> 
+// FreeRTOS Headers are removed for single-core operation
+
+// ============================= CONFIGURATION ==============================
+
+// --- 1. Wi-Fi Credentials & Channel ---
+const char* ssid = "iQOO Z7 Pro 5G";
+const char* password = "12345679";
+const uint8_t WIFI_CHANNEL = 6; 
+const int HTTP_PORT = 80; 
+
+// --- 2. Server Details (Flask App for sending sensor data) ---
+const char* flaskIngestUrl = "http://192.168.218.117:5001/ingest"; 
+
+// --- 3. MAC Addresses (Repeater for sending commands) ---
+uint8_t repeaterMac[] = { 0x8C, 0x4F, 0x00, 0x2E, 0x23, 0x3C }; 
+
+// ======================= GLOBAL STATE (Single-Core Data Buffer) =======================
+
+// Buffer and flag to safely transfer received ESP-NOW data from the ISR to the main loop
+char incomingDataBuffer[300] = "";
+volatile bool newDataAvailable = false;
+
+volatile bool currentAlertState = false; // Tracks the alert state received from Flask
+
+// ========================= UTILITY FUNCTIONS =========================
+
+void reconnectWiFi() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.print("\nAttempting to reconnect Wi-Fi...");
+        WiFi.begin(ssid, password);
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) { 
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\n✅ Wi-Fi Reconnected!");
+            Serial.print("Control Room IP Address: ");
+            Serial.println(WiFi.localIP());
+        } else {
+            Serial.println("\n❌ Wi-Fi Reconnection Failed!");
+        }
+    }
+}
+
+
+// ========================= HTTP ALERT RECEIVER (Web Server) =========================
+
+// WebServer runs on the main core/loop
+WebServer server(HTTP_PORT);
+
+void sendAlertCommand(bool state) {
+    char command[30];
+    snprintf(command, sizeof(command), "ALERT_CMD:%d", state ? 1 : 0);
+    esp_err_t result = esp_now_send(repeaterMac, (const uint8_t *)command, strlen(command)); 
+    Serial.printf("\n📤 ESP-NOW Command to Repeater: %s | Status: %s\n",
+                  command, (result == ESP_OK) ? "Sent" : "Failed");
+}
+
+void handleAlertWebhook() {
+    String message = "Received unknown alert";
+    String alert_type = "neutral";
+
+    // 1. Parse JSON from Flask POST request body
+    if (server.hasHeader("Content-Type") && server.header("Content-Type").indexOf("application/json") != -1) {
+        StaticJsonDocument<512> doc; 
+        DeserializationError error = deserializeJson(doc, server.arg("plain"));
+
+        if (!error) {
+            alert_type = doc["type"] | "neutral"; 
+            message = doc["message"] | "Control room alert received.";
+        }
+    }
+    
+    // 2. Process the received alert type
+    if (alert_type.equalsIgnoreCase("alert")) {
+        Serial.println("\n🚨🚨 ALERT RECEIVED FROM FLASK SERVER! 🚨🚨");
+        currentAlertState = true;
+    } else {
+        Serial.println("\n🟢 Alert NEUTRALIZED by Flask Server.");
+        currentAlertState = false;
+    }
+    
+    Serial.printf("Server Message: %s\n", message.c_str());
+
+    // 3. Send the command via ESP-NOW to the repeater 
+    sendAlertCommand(currentAlertState); 
+
+    // 4. Respond to Flask app with success
+    server.send(200, "application/json", "{\"status\":\"ok\",\"action\":\"processed\"}");
+}
+
+// ========================== HTTP BRIDGE LOGIC ============================
+
+// Performs the blocking HTTP POST operation with retry logic.
+// Returns true on successful POST, false otherwise.
+bool performHttpPost(const char* dataPayload) {
+    // Ensure Wi-Fi is connected before attempting HTTP
+    reconnectWiFi(); 
+
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(flaskIngestUrl); 
+        
+        http.addHeader("Content-Type", "application/json"); 
+        
+        Serial.print("🌐 Attempting HTTP POST...");
+
+        char localJsonPayload[350] = ""; 
+        
+        StaticJsonDocument<500> doc;
+        doc["payload"] = dataPayload; 
+
+        size_t payloadSize = serializeJson(doc, localJsonPayload, sizeof(localJsonPayload));
+        
+        if (payloadSize == 0) {
+              Serial.println("❌ JSON serialization failed.");
+              http.end();
+              return false; // Return false on serialization failure
+        }
+
+        int httpResponseCode = http.POST((const char*)localJsonPayload); 
+        
+        if (httpResponseCode >= 200 && httpResponseCode < 300) {
+            String response = http.getString();
+            Serial.printf("✅ HTTP FORWARD SUCCESS. Code: %d | Server Reply: %s\n", 
+                          httpResponseCode, response.c_str());
+            http.end();
+            return true; // Return true on success
+        } else {
+            String errorMsg = http.errorToString(httpResponseCode);
+            Serial.printf("❌ HTTP POST FAILED. Code: %d, Error: %s\n", 
+                          httpResponseCode, errorMsg.c_str());
+            http.end();
+            return false; // Return false on Wi-Fi failure
+        }
+    } else {
+        Serial.println("❌ Wi-Fi not connected. Cannot perform POST.");
+        return false; // Return false on Wi-Fi failure
+    }
+}
+
+// =========================== ESP-NOW CALLBACKS ===========================
+
+// --- OnDataRecv (Runs in Interrupt Context - MUST BE FAST) ---
+// Writes data to the global buffer and sets the flag for the loop to process.
+void IRAM_ATTR OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    // If the loop hasn't processed the last packet yet, drop the new one to prevent corruption
+    if (newDataAvailable) {
+        return; 
+    }
+
+    // 1. Prepare the buffer
+    if (len > sizeof(incomingDataBuffer) - 1) len = sizeof(incomingDataBuffer) - 1;
+    memcpy(incomingDataBuffer, data, len);
+    incomingDataBuffer[len] = '\0';
+    
+    // 2. Signal that data is ready
+    newDataAvailable = true;
+}
+
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    // No change needed
+}
+
+// =================================== SETUP ===================================
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n🚀 Initializing Control Room (Single-Core)...");
+
+    // 1. Initialize and connect Wi-Fi
+    WiFi.mode(WIFI_STA);
+    
+    // Setting max power using the standard enum for high power (WIFI_POWER_19_5dBm)
+    // This is used for maximum compatibility across different ESP32 core versions.
+    if (WiFi.setTxPower(WIFI_POWER_19_5dBm)) { 
+        Serial.println("⬆️ Radio TX Power set to 19.5dBm.");
+    } else {
+        Serial.println("⚠️ Could not set max TX power. Using default.");
+    }
+    
+    WiFi.setChannel(WIFI_CHANNEL); 
+    reconnectWiFi(); 
+    delay(100); 
+
+    // 2. Setup HTTP Server Handler 
+    server.on("/alert", HTTP_POST, handleAlertWebhook); 
+    server.begin();
+    Serial.printf("✅ HTTP Server listening on port %d/alert\n", HTTP_PORT);
+
+    // 3. Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("❌ ESP-NOW Initialization Failed! Restarting..."); 
+        ESP.restart();
+    }
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_now_register_send_cb(OnDataSent);
+
+    // 4. Add Repeater as peer
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, repeaterMac, 6);
+    peerInfo.channel = WIFI_CHANNEL; 
+    peerInfo.encrypt = false; 
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("❌ Failed to add Repeater peer");
+    }
+    
+    Serial.printf("✅ Control Room Ready on Channel %d (Single-Core Bridge)\n", WIFI_CHANNEL);
+    Serial.println("Type 'A' / 'N' in Serial Monitor to send Alert/Neutralize.");
+}
+
+// =================================== LOOP ===================================
+
+void loop() {
+    // 1. Check Wi-Fi connection continuously
+    reconnectWiFi();
+
+    // 2. Handle incoming HTTP requests (Alerts from Flask) - High priority, quick execution
+    server.handleClient(); 
+
+    // 3. Process ESP-NOW data if available (This section contains the blocking HTTP call)
+    if (newDataAvailable) {
+        // Reset flag immediately to prevent ISR from writing over the buffer while we process it
+        newDataAvailable = false; 
+        
+        bool success = false;
+        int retries = 0;
+        const int MAX_RETRIES = 3;
+
+        Serial.printf("🌐 Processing received packet (Size: %d)...\n", strlen(incomingDataBuffer));
+
+        // Retry loop
+        while (!success && retries < MAX_RETRIES) {
+            if (retries > 0) {
+                Serial.printf("🌐 Retry %d/%d: Waiting 2s before next attempt...\n", retries, MAX_RETRIES);
+                delay(2000); // Wait between retries
+            }
+            
+            // !!! THIS IS THE BLOCKING CALL !!!
+            success = performHttpPost(incomingDataBuffer);
+            retries++;
+        }
+
+        if (!success) {
+            Serial.printf("❌ Packet dropped after %d failed attempts. Data lost.\n", MAX_RETRIES);
+        }
+    }
+    
+    // 4. Handle Serial Commands
+    if (Serial.available()) {
+        char cmd = Serial.read();
+        if (cmd == 'A' || cmd == 'a') {
+            Serial.println("Manual Command: Sending ALERT.");
+            sendAlertCommand(true);
+        } else if (cmd == 'N' || cmd == 'n') {
+            Serial.println("Manual Command: Sending NEUTRALIZED.");
+            sendAlertCommand(false);
+        }
+    }
+
+    // A short delay to allow the Wi-Fi stack to perform background tasks
+    delay(20); 
+}
