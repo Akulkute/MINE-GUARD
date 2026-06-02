@@ -46,6 +46,13 @@ MineGuard operates on a three-tier architecture:
 *   **Communication:** ESP-NOW, WIFI
 *   **Sensors:** MQ-9 (Methane), MQ-135 (Carbon Monoxide), LM35 (Temp/Humidity), MAX30105(SpO2)
 
+### To get Frontend & Backend codes follow the below repo 
+```bash
+
+https://github.com/singharpita2503/minning_daashboard.git)
+
+```
+
 ### Backend & AI
 *   **Runtime:** Node.js / Python 3.10
 *   **Framework:** FastAPI / Express.js
