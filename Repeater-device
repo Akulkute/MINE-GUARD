@@ -1,0 +1,95 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <string.h>
+
+// ============================= CONFIGURATION ==============================
+
+// Set Channel 6 for entire Repeater operation
+const uint8_t WIFI_CHANNEL = 6; 
+
+// -------------------- MAC Addresses --------------------
+uint8_t controlRoomMac[] = { 0x08, 0xB6, 0x1F, 0xB8, 0x6A, 0x30 }; // Control Room ESP MAC
+uint8_t backPcbMac[] = { 0x68, 0x25, 0xDD, 0x32, 0xAB, 0x8C }; // Back PCB ESP MAC
+
+
+// -------------------- Helper: Add Peer --------------------
+bool addPeer(const uint8_t *mac_addr, const char *name) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac_addr, 6);
+    peerInfo.channel = WIFI_CHANNEL; // <-- SET CHANNEL 6
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.printf("❌ Failed to add %s peer on Channel %d\n", name, WIFI_CHANNEL);
+        return false;
+    }
+    Serial.printf("✅ %s peer added successfully on Channel %d\n", name, WIFI_CHANNEL);
+    return true;
+}
+
+// -------------------- Callback: Send Status --------------------
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.printf("📤 Send Status → %s\n",
+                  status == ESP_NOW_SEND_SUCCESS ? "✅ Success" : "❌ Fail");
+}
+
+// -------------------- Callback: Receive Data (The Router Logic) --------------------
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    char msg[300]; 
+    if (len > sizeof(msg) - 1) len = sizeof(msg) - 1;
+    memcpy(msg, data, len);
+    msg[len] = '\0';
+
+    Serial.println("\n📩 Received at Repeater:");
+    Serial.println(msg);
+
+    // From Control Room (Alert Command)
+    if (memcmp(info->src_addr, controlRoomMac, 6) == 0) {
+        Serial.println("🔹 Source: Control Room");
+        Serial.print("🔸 Forwarding to Back PCB: ");
+        Serial.println(msg);
+        esp_now_send(backPcbMac, (uint8_t *)msg, strlen(msg));
+    }
+
+    // From Back PCB (Combined Sensor Data)
+    else if (memcmp(info->src_addr, backPcbMac, 6) == 0) {
+        Serial.println("🔹 Source: Back PCB (Sensor Data)");
+        Serial.print("🔸 Forwarding to Control Room: ");
+        Serial.println(msg);
+        esp_now_send(controlRoomMac, (uint8_t *)msg, strlen(msg));
+    }
+
+    else {
+        Serial.println("⚠ Unknown sender! Dropping packet.");
+    }
+}
+
+
+// -------------------- Setup --------------------
+void setup() {
+    Serial.begin(115200);
+    Serial.println("\n🚀 Initializing Repeater...");
+
+    // Set Repeater's operating channel to 6
+    WiFi.mode(WIFI_STA);
+    WiFi.setChannel(WIFI_CHANNEL); 
+
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("❌ ESP-NOW init failed!");
+        while (true);
+    }
+
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_now_register_send_cb(OnDataSent);
+
+    // Add peers with Channel 6
+    addPeer(controlRoomMac, "Control Room");
+    addPeer(backPcbMac, "Back PCB");
+
+    Serial.printf("✅ Repeater Ready on Channel %d\n", WIFI_CHANNEL);
+}
+
+// -------------------- Loop --------------------
+void loop() {
+    delay(100);
+}
