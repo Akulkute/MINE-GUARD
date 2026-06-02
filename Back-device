@@ -1,0 +1,234 @@
+#include <WiFi.h>
+#include <esp_now.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <string.h>
+
+// ============================= CONFIGURATION ==============================
+
+// CRITICAL: All devices must be on the same channel for the mesh to work.
+const uint8_t WIFI_CHANNEL = 6; 
+
+// -------------------- Pins --------------------
+#define MQ9_PIN    34
+#define MQ135_PIN   35
+#define ONE_WIRE_BUS 25
+#define BUZZER_PIN  32
+#define HAPTIC_PIN  33
+
+// -------------------- MQ Sensor Constants & Globals --------------------
+#define RL_VALUE 10.0
+#define RO_CLEAN_AIR_FACTOR_MQ9  9.83
+#define RO_CLEAN_AIR_FACTOR_MQ135 3.6
+#define CALIBRATION_SAMPLE_TIMES 50
+float MQ9_COCurve[3]  = {2.3, 0.24, -0.49};
+float MQ135_COCurve[3] = {2.3, 0.22, -0.45};
+float Ro_MQ9  = 10.0;
+float Ro_MQ135 = 10.0;
+
+// -------------------- Sensors --------------------
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// -------------------- MACs --------------------
+uint8_t repeaterMac[] = {0x8C, 0x4F, 0x00, 0x2E, 0x23, 0x3C}; // Repeater/Router
+uint8_t handMac[]   = {0x2C, 0xF4, 0x32, 0x02, 0x40, 0x7C}; // Hand PCB
+
+// -------------------- Globals --------------------
+bool alertActive = false;
+bool handDataReceived = false;
+unsigned long lastSendTime = 0;
+const unsigned long sendInterval = 2000;
+String lastHandData = "HANDPCB:NODATA"; 
+
+
+// -------------------- Helper: Add Peer --------------------
+bool addPeer(const uint8_t *mac_addr, const char *name) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, mac_addr, 6);
+    peerInfo.channel = WIFI_CHANNEL; // <-- SET CHANNEL 6
+    peerInfo.encrypt = false;
+
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.printf("❌ Failed to add %s peer\n", name);
+        return false;
+    }
+    Serial.printf("✅ %s peer added successfully on Channel %d\n", name, WIFI_CHANNEL);
+    return true;
+}
+
+// -------------------- Alert Logic --------------------
+void beepPattern() {
+ for (int i = 0; i < 3; i++) {
+  digitalWrite(BUZZER_PIN, HIGH);
+  digitalWrite(HAPTIC_PIN, HIGH);
+  delay(100);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(HAPTIC_PIN, LOW);
+  delay(100);
+ }
+ delay(700);
+}
+
+void activateLocalAlert() {
+ if (!alertActive) {
+  alertActive = true;
+  Serial.println("🚨 ALERT ACTIVATED → SOS Pattern Running");
+ }
+}
+
+void deactivateLocalAlert() {
+ if (alertActive) {
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(HAPTIC_PIN, LOW);
+  alertActive = false;
+  Serial.println("✅ ALERT DEACTIVATED");
+
+  // Send neutralization command back to Hand PCB
+  const char *neutralMsg = "N";
+  esp_now_send(handMac, (uint8_t *)neutralMsg, strlen(neutralMsg));
+  Serial.println("📤 Sent Neutralization Code 'N' to Hand PCB");
+ }
+}
+
+// -------------------- ESP-NOW Callbacks --------------------
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+ // Optional debug
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+ char msg[200];
+ memcpy(msg, data, len);
+ msg[len] = '\0';
+
+ // --- From Hand PCB (Sensor Data) ---
+ if (memcmp(info->src_addr, handMac, 6) == 0) {
+  Serial.print("\n📡 Received from Hand PCB (Sensor Data): ");
+  Serial.println(msg);
+  handDataReceived = true;
+  lastHandData = String("HANDPCB,") + String(msg); // Save the message for forwarding
+
+  // Check for ALERT:1 from Hand PCB (manual button press)
+  if (strstr(msg, "ALERT:1") != NULL) {
+   activateLocalAlert();
+  }
+ }
+
+ // --- From Repeater (Command/Alert) ---
+ else if (memcmp(info->src_addr, repeaterMac, 6) == 0) {
+  Serial.print("\n📡 Received from Repeater (Command): ");
+  Serial.println(msg);
+
+  // Handle local alerts (from Control Room via Repeater)
+  if (strstr(msg, "ALERT_CMD:1") != NULL) {
+   activateLocalAlert();
+  }
+  if (strstr(msg, "ALERT_CMD:0") != NULL) {
+   deactivateLocalAlert();
+  }
+ }
+}
+
+// -------------------- MQ Sensor Functions --------------------
+float MQResistanceCalculation(int raw_adc) {
+ if (raw_adc == 0) raw_adc = 1;
+ float voltage = raw_adc * (3.3 / 4095.0);
+ float rs = (3.3 - voltage) * RL_VALUE / voltage;
+ return rs;
+}
+
+float MQCalibration(int pin, float cleanAirFactor) {
+ float val = 0;
+ for (int i = 0; i < CALIBRATION_SAMPLE_TIMES; i++) {
+  val += MQResistanceCalculation(analogRead(pin));
+  delay(50);
+ }
+ val = val / CALIBRATION_SAMPLE_TIMES;
+ return val / cleanAirFactor;
+}
+
+float MQRead(int pin) {
+ float rs = 0;
+ for (int i = 0; i < 5; i++) {
+  rs += MQResistanceCalculation(analogRead(pin));
+  delay(50);
+ }
+ return rs / 5;
+}
+
+float MQGetPercentage(float rs_ro_ratio, float *pcurve) {
+ return pow(10, ((log10(rs_ro_ratio) - pcurve[1]) / pcurve[2]) + pcurve[0]);
+}
+
+// -------------------- Setup --------------------
+void setup() {
+ Serial.begin(115200);
+ Serial.println("\n🚀 Starting Back PCB...");
+
+ // Set Wi-Fi channel 6
+ WiFi.mode(WIFI_STA);
+ WiFi.setChannel(WIFI_CHANNEL); 
+
+ pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
+ sensors.begin();
+
+ pinMode(BUZZER_PIN, OUTPUT);
+ pinMode(HAPTIC_PIN, OUTPUT);
+ deactivateLocalAlert(); // Ensure actuators are off
+
+ if (esp_now_init() != ESP_OK) {
+  Serial.println("❌ ESP-NOW Init Failed!"); while (true);
+ }
+
+ esp_now_register_recv_cb(OnDataRecv);
+ esp_now_register_send_cb(OnDataSent);
+
+ // Add Peers with Channel 6
+ addPeer(repeaterMac, "Repeater");
+ addPeer(handMac, "Hand PCB");
+
+ Serial.println("⚙️ Calibrating MQ sensors...");
+ Ro_MQ9 = MQCalibration(MQ9_PIN, RO_CLEAN_AIR_FACTOR_MQ9);
+ Ro_MQ135 = MQCalibration(MQ135_PIN, RO_CLEAN_AIR_FACTOR_MQ135);
+ Serial.printf("✅ Calibration Done → MQ9 Ro=%.2f kΩ | MQ135 Ro=%.2f kΩ\n", Ro_MQ9, Ro_MQ135);
+
+ Serial.printf("✅ Back PCB Ready on Channel %d\n", WIFI_CHANNEL);
+}
+
+// -------------------- Loop --------------------
+void loop() {
+ if (alertActive) beepPattern();
+
+ if (millis() - lastSendTime > sendInterval) {
+  lastSendTime = millis();
+
+  if (!handDataReceived) {
+   Serial.println("⚠️ Waiting for Hand PCB data... Not sending yet.");
+   return;
+  }
+
+  // Read MQ and DS18B20 Sensors
+  float rs_mq9 = MQRead(MQ9_PIN);
+  float rs_mq135 = MQRead(MQ135_PIN);
+  float ratio_mq9 = rs_mq9 / Ro_MQ9;
+  float ratio_mq135 = rs_mq135 / Ro_MQ135;
+  float ppm_mq9 = MQGetPercentage(ratio_mq9, MQ9_COCurve);
+  float ppm_mq135 = MQGetPercentage(ratio_mq135, MQ135_COCurve);
+
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+
+  if (tempC == DEVICE_DISCONNECTED_C || tempC == -127) {
+   tempC = -99.0; // Use sentinel value if sensor fails
+  }
+  
+  // Combine both Back + Hand PCB data into the final string
+  char sendMsg[300];
+  snprintf(sendMsg, sizeof(sendMsg),
+      "%s | BACKPCB,DS18B20:%.1f,MQ9_PPM:%.2f,MQ135_PPM:%.2f",
+      lastHandData.c_str(), tempC, ppm_mq9, ppm_mq135);
+  // Send combined data to Repeater
+  esp_now_send(repeaterMac, (uint8_t *)sendMsg, strlen(sendMsg));
+  Serial.printf("📤 Sent Combined Data → Repeater: %s\n", sendMsg);
+ }
+}
