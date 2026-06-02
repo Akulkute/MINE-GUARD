@@ -1,5 +1,5 @@
 # MINE-GUARD
-# MineGuard: IoT & AI-Powered Miner Safety System
+# MineGuard: IoT Miner Safety System
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)
