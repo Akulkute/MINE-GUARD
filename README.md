@@ -29,10 +29,14 @@ MineGuard operates on a three-tier architecture:
 
 ## System is divided in 5 parts
 1. **HAND-device:** Track the heart beat and SpO2 readings. As well as it show the visual alerts and can send the SOS alerts from the miner to control room using ESP-01
+
 2. **BACK-device:** It consist of the 3 sensors Temp., MQ-9, MQ-135, LM35 to measure the parameters of the gas inside the tunnel. It also forward the data comming from the hand-device to the repeater-device.
-3. **REPEATER-device** It forward the data coming from the hand & back device to the control room using ESP-now Protocol which gives the range of 100 meters in the tunnel.
+
+3. **REPEATER-device:** It forward the data coming from the hand & back device to the control room using ESP-now Protocol which gives the range of 100 meters in the tunnel.
+
 4. **CONTROLROOM-device:** It takes the reading from the repeater and process it and can send alerts to the miners. The data is send to the dashboard.
-5. **DASHBOARD** It shows the data of all the miners currently working in the mine and also send the alerts to the miner regarding the SpO2 & Temp. levels.
+
+5. **DASHBOARD:** It shows the data of all the miners currently working in the mine and also send the alerts to the miner regarding the SpO2 & Temp. levels.
 ---
 
 ## 🛠️ Tech Stack
